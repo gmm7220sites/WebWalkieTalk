@@ -111,6 +111,14 @@
             color: #000;
             box-shadow: 0 0 20px rgba(50, 255, 50, 0.8), inset 0 0 20px rgba(0,0,0,0.5);
         }
+        
+        .ptt-btn.disabled {
+            background-color: #222;
+            border-color: #555;
+            color: #555;
+            cursor: not-allowed;
+            box-shadow: none;
+        }
 
         .status { margin-top: 15px; font-size: 14px; color: #D3D4CB; }
     </style>
@@ -149,12 +157,11 @@
     let appId = "walkietalkie-global";
 
     try {
-        // Modo simulador
         firebaseConfig = JSON.parse(__firebase_config);
         if (typeof __app_id !== 'undefined') appId = __app_id;
         isCanvas = true;
     } catch (e) {
-        // 🔴 MODO GITHUB: Tu configuración de Firebase
+        // Tu configuración de Firebase
         firebaseConfig = {
             apiKey: "AIzaSyAZJndi8_0x2_HQLcMQF-oxhoRLDr4izIc",
             authDomain: "webwalkietalk.firebaseapp.com",
@@ -171,7 +178,6 @@
 
     let messagesRef, usersRef;
 
-    // Ajuste de colecciones (simplificado para tu proyecto personal)
     if (isCanvas) {
         messagesRef = collection(db, 'artifacts', appId, 'public', 'data', 'walkie_messages');
         usersRef = collection(db, 'artifacts', appId, 'public', 'data', 'walkie_users');
@@ -189,9 +195,10 @@
     let currentFreq = 462.550;
     let isTransmitting = false;
     let isReceiving = false;
+    let isSendingData = false; // Nuevo estado para evitar bloqueos
     
     // Audio API
-    let audioCtx, analyser, microphone;
+    let audioCtx, analyser, microphone, globalStream;
     let mediaRecorder;
     let audioChunks = [];
     let animationId;
@@ -260,81 +267,113 @@
     }
 
     // ==========================================
-    // 4. TRANSMISIÓN DE AUDIO (TX)
+    // 4. TRANSMISIÓN DE AUDIO (TX) MEJORADA
     // ==========================================
-    async function startRecording() {
-        if (isReceiving) return; 
-
-        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        
+    
+    // Función para pedir permiso del micrófono solo UNA VEZ
+    async function initMicrophone() {
+        if (globalStream) return true;
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            
+            globalStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             analyser = audioCtx.createAnalyser();
             analyser.fftSize = 256;
-            microphone = audioCtx.createMediaStreamSource(stream);
+            microphone = audioCtx.createMediaStreamSource(globalStream);
             microphone.connect(analyser);
-            
-            audioChunks = [];
-            mediaRecorder = new MediaRecorder(stream);
-            
-            mediaRecorder.ondataavailable = e => {
-                if (e.data.size > 0) audioChunks.push(e.data);
-            };
+            return true;
+        } catch (err) {
+            alert("Error: Para transmitir debes dar permiso de micrófono.");
+            console.error(err);
+            return false;
+        }
+    }
 
-            mediaRecorder.onstop = () => {
-                const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-                const reader = new FileReader();
-                reader.readAsDataURL(audioBlob);
-                reader.onloadend = () => {
-                    const base64Audio = reader.result;
-                    addDoc(messagesRef, {
+    async function startRecording(e) {
+        if (e) e.preventDefault();
+        
+        // Evita cruces: Si estamos recibiendo o enviando, ignorar el botón
+        if (isReceiving || isSendingData || isTransmitting) return; 
+
+        statusLabel.innerText = "Iniciando micrófono...";
+        
+        const micReady = await initMicrophone();
+        if (!micReady) {
+            statusLabel.innerText = "Permiso de micrófono denegado.";
+            return;
+        }
+
+        // Configurar y arrancar grabadora
+        audioChunks = [];
+        mediaRecorder = new MediaRecorder(globalStream);
+        
+        mediaRecorder.ondataavailable = event => {
+            if (event.data.size > 0) audioChunks.push(event.data);
+        };
+
+        mediaRecorder.onstop = async () => {
+            if (audioChunks.length === 0) return;
+
+            isSendingData = true;
+            pttBtn.classList.add('disabled');
+            statusLabel.innerText = "Enviando paquete de datos...";
+            statusLabel.style.color = "#D5DE10";
+
+            // Convertir a base64
+            const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+            const reader = new FileReader();
+            reader.readAsDataURL(audioBlob);
+            reader.onloadend = async () => {
+                const base64Audio = reader.result;
+                try {
+                    await addDoc(messagesRef, {
                         userId: myUserId,
                         freq: currentFreq,
                         audio: base64Audio,
                         timestamp: Date.now()
                     });
-                };
+                    statusLabel.innerText = "Mensaje enviado con éxito.";
+                } catch (err) {
+                    console.error("Error enviando:", err);
+                    statusLabel.innerText = "Error enviando el mensaje.";
+                }
+                
+                isSendingData = false;
+                pttBtn.classList.remove('disabled');
+                statusLabel.style.color = "#D3D4CB";
+                setTimeout(() => { 
+                    if(!isTransmitting && !isReceiving && !isSendingData) {
+                        statusLabel.innerText = "Standby. Presiona PTT para hablar."; 
+                    }
+                }, 1500);
             };
+        };
 
-            mediaRecorder.start();
-            isTransmitting = true;
-            
-            pttBtn.classList.add('tx-active');
-            pttBtn.innerText = "TX";
-            statusLabel.innerText = "Emitiendo voz a la red...";
-            statusLabel.style.color = "#ff3232";
-            
-            drawWaveTX(); 
-            
-        } catch (err) {
-            alert("Error: Para transmitir debes dar permiso de micrófono (Requiere HTTPS).");
-            console.error(err);
-        }
+        mediaRecorder.start();
+        isTransmitting = true;
+        
+        pttBtn.classList.add('tx-active');
+        pttBtn.innerText = "TX";
+        statusLabel.innerText = "Emitiendo voz...";
+        statusLabel.style.color = "#ff3232";
+        
+        drawWaveTX(); 
     }
 
-    function stopRecording() {
+    function stopRecording(e) {
+        if (e) e.preventDefault();
         if (!isTransmitting) return;
+        
         isTransmitting = false;
         
         if (mediaRecorder && mediaRecorder.state !== "inactive") {
             mediaRecorder.stop();
         }
-        
-        if (microphone) {
-            microphone.disconnect();
-            microphone.mediaStream.getTracks().forEach(track => track.stop());
-        }
 
         pttBtn.classList.remove('tx-active');
         pttBtn.innerText = "PTT";
-        statusLabel.innerText = "Mensaje enviado.";
-        statusLabel.style.color = "#D3D4CB";
         
         cancelAnimationFrame(animationId);
         drawFlatLine();
-        
-        setTimeout(() => { if(!isTransmitting && !isReceiving) statusLabel.innerText = "Standby."; }, 2000);
     }
 
     // ==========================================
@@ -345,7 +384,7 @@
             snapshot.docChanges().forEach((change) => {
                 if (change.type === 'added') {
                     const msg = change.doc.data();
-                    
+                    // Evita reproducir si el mensaje es viejo, es de otra frecuencia, o lo enviaste tú
                     if (msg.timestamp > appStartTime && msg.freq === currentFreq && msg.userId !== myUserId) {
                         playIncomingAudio(msg.audio);
                     }
@@ -355,7 +394,7 @@
     }
 
     function playIncomingAudio(base64Data) {
-        if (isTransmitting) return; 
+        if (isTransmitting || isSendingData) return; 
 
         isReceiving = true;
         pttBtn.classList.add('rx-active');
@@ -364,7 +403,10 @@
         statusLabel.style.color = "#32ff32";
 
         const audio = new Audio(base64Data);
-        audio.play().catch(e => console.error("Autoplay bloqueado:", e));
+        audio.play().catch(e => {
+            console.error("Autoplay bloqueado:", e);
+            statusLabel.innerText = "Haz clic en la pantalla para permitir el audio.";
+        });
 
         drawWaveRX(); 
 
@@ -372,7 +414,7 @@
             isReceiving = false;
             pttBtn.classList.remove('rx-active');
             pttBtn.innerText = "PTT";
-            statusLabel.innerText = "Standby.";
+            statusLabel.innerText = "Standby. Presiona PTT para hablar.";
             statusLabel.style.color = "#D3D4CB";
             cancelAnimationFrame(animationId);
             drawFlatLine();
@@ -390,12 +432,13 @@
     document.getElementById('btnDown').addEventListener('click', () => { currentFreq -= 0.025; updateFreq(); });
     document.getElementById('btnUp').addEventListener('click', () => { currentFreq += 0.025; updateFreq(); });
 
+    // Soportar eventos táctiles y de mouse sin conflictos
     pttBtn.addEventListener('mousedown', startRecording);
-    pttBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
+    pttBtn.addEventListener('touchstart', startRecording, {passive: false});
 
-    pttBtn.addEventListener('mouseup', stopRecording);
-    pttBtn.addEventListener('mouseleave', () => { if(isTransmitting) stopRecording(); });
-    pttBtn.addEventListener('touchend', stopRecording);
+    window.addEventListener('mouseup', stopRecording);
+    pttBtn.addEventListener('touchend', stopRecording, {passive: false});
+    pttBtn.addEventListener('touchcancel', stopRecording, {passive: false});
 
     // ==========================================
     // 7. MOTOR GRÁFICO DEL OSCILOSCOPIO
