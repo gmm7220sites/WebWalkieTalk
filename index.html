@@ -36,7 +36,7 @@
             display: flex;
             align-items: center;
             justify-content: center;
-            margin: 20px 0;
+            margin: 15px 0;
             background: #111;
             padding: 10px;
             border-radius: 10px;
@@ -60,6 +60,17 @@
             color: #32ffff;
             margin: 0 15px;
             font-weight: bold;
+        }
+
+        .users-badge {
+            background-color: #32ffff;
+            color: #111;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-bottom: 15px;
+            display: inline-block;
         }
 
         canvas {
@@ -87,11 +98,18 @@
             -webkit-tap-highlight-color: transparent;
         }
 
-        .ptt-btn.active {
+        .ptt-btn.tx-active {
             background-color: #ff3232;
             border-color: #ff9696;
             color: white;
             box-shadow: 0 0 20px rgba(255, 50, 50, 0.8), inset 0 0 20px rgba(0,0,0,0.5);
+        }
+
+        .ptt-btn.rx-active {
+            background-color: #32ff32;
+            border-color: #96ff96;
+            color: #000;
+            box-shadow: 0 0 20px rgba(50, 255, 50, 0.8), inset 0 0 20px rgba(0,0,0,0.5);
         }
 
         .status { margin-top: 15px; font-size: 14px; color: #D3D4CB; }
@@ -100,114 +118,291 @@
 <body>
 
 <div class="container">
-    <h2>Web Walkie-Talkie</h2>
+    <h2>Global WebComms</h2>
     
+    <div class="users-badge" id="usersLabel">Buscando usuarios...</div>
+
     <div class="freq-control">
         <button class="btn-freq" id="btnDown">-</button>
         <div class="freq-display" id="freqLabel">462.550 MHz</div>
         <button class="btn-freq" id="btnUp">+</button>
     </div>
 
-    <!-- Osciloscopio Web -->
     <canvas id="waveCanvas"></canvas>
 
     <button class="ptt-btn" id="pttBtn">PTT</button>
     
-    <div class="status" id="statusLabel">Standby. Presiona PTT para hablar.</div>
+    <div class="status" id="statusLabel">Standby. Conectando a la red...</div>
 </div>
 
-<script>
-    // Variables de Audio Web
-    let audioCtx;
-    let analyser;
-    let microphone;
-    let jsNode;
-    let isTransmitting = false;
+<!-- Usamos Type Module para importar Firebase -->
+<script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, collection, doc, setDoc, onSnapshot, addDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // ==========================================
+    // 1. CONFIGURACIÓN FIREBASE 
+    // ==========================================
+    let firebaseConfig;
+    let isCanvas = false;
+    let appId = "walkietalkie-global";
+
+    try {
+        // Modo simulador
+        firebaseConfig = JSON.parse(__firebase_config);
+        if (typeof __app_id !== 'undefined') appId = __app_id;
+        isCanvas = true;
+    } catch (e) {
+        // 🔴 MODO GITHUB: Tu configuración de Firebase
+        firebaseConfig = {
+            apiKey: "AIzaSyAZJndi8_0x2_HQLcMQF-oxhoRLDr4izIc",
+            authDomain: "webwalkietalk.firebaseapp.com",
+            projectId: "webwalkietalk",
+            storageBucket: "webwalkietalk.firebasestorage.app",
+            messagingSenderId: "148022173413",
+            appId: "1:148022173413:web:fdf109271f8d7ce06efe0c"
+        };
+    }
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+
+    let messagesRef, usersRef;
+
+    // Ajuste de colecciones (simplificado para tu proyecto personal)
+    if (isCanvas) {
+        messagesRef = collection(db, 'artifacts', appId, 'public', 'data', 'walkie_messages');
+        usersRef = collection(db, 'artifacts', appId, 'public', 'data', 'walkie_users');
+    } else {
+        messagesRef = collection(db, 'walkie_messages');
+        usersRef = collection(db, 'walkie_users');
+    }
+
+    let myUserId = "";
+    const appStartTime = Date.now();
+
+    // ==========================================
+    // 2. VARIABLES DE AUDIO Y APP
+    // ==========================================
     let currentFreq = 462.550;
+    let isTransmitting = false;
+    let isReceiving = false;
+    
+    // Audio API
+    let audioCtx, analyser, microphone;
+    let mediaRecorder;
+    let audioChunks = [];
     let animationId;
 
-    // Elementos del DOM
     const freqLabel = document.getElementById('freqLabel');
     const pttBtn = document.getElementById('pttBtn');
     const statusLabel = document.getElementById('statusLabel');
+    const usersLabel = document.getElementById('usersLabel');
     const canvas = document.getElementById('waveCanvas');
     const canvasCtx = canvas.getContext('2d');
-
-    // Ajustar el Canvas
     canvas.width = canvas.clientWidth;
     canvas.height = canvas.clientHeight;
 
-    // Control de Frecuencia
-    document.getElementById('btnDown').addEventListener('click', () => {
-        currentFreq -= 0.025;
-        freqLabel.innerText = currentFreq.toFixed(3) + " MHz";
-    });
-    
-    document.getElementById('btnUp').addEventListener('click', () => {
-        currentFreq += 0.025;
-        freqLabel.innerText = currentFreq.toFixed(3) + " MHz";
+    // ==========================================
+    // 3. INICIO DE SESIÓN Y RADAR DE USUARIOS
+    // ==========================================
+    const initAuth = async () => {
+        try {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+                await signInAnonymously(auth);
+            }
+        } catch (error) {
+            console.error("Error de Auth:", error);
+            statusLabel.innerText = "Error conectando al servidor.";
+        }
+    };
+
+    onAuthStateChanged(auth, (user) => {
+        if (user) {
+            myUserId = user.uid;
+            statusLabel.innerText = "Conectado. Presiona PTT para hablar.";
+            startUserPing();
+            listenToMessages();
+            listenToUsers();
+        }
     });
 
-    // Iniciar el Contexto de Audio y pedir permiso de micrófono
-    async function startAudio() {
-        if (!audioCtx) {
-            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        }
+    function startUserPing() {
+        const updatePresence = () => {
+            if(!myUserId) return;
+            setDoc(doc(usersRef, myUserId), {
+                freq: currentFreq,
+                lastPing: Date.now()
+            });
+        };
+        updatePresence();
+        setInterval(updatePresence, 5000); 
+    }
+
+    function listenToUsers() {
+        onSnapshot(usersRef, (snapshot) => {
+            const now = Date.now();
+            let activeCount = 0;
+            
+            snapshot.forEach((docSnap) => {
+                const data = docSnap.data();
+                if (data.freq === currentFreq && (now - data.lastPing) < 15000) {
+                    activeCount++;
+                }
+            });
+
+            usersLabel.innerText = `${activeCount} online en este canal`;
+        }, (error) => console.error("Error usuarios:", error));
+    }
+
+    // ==========================================
+    // 4. TRANSMISIÓN DE AUDIO (TX)
+    // ==========================================
+    async function startRecording() {
+        if (isReceiving) return; 
+
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            
             analyser = audioCtx.createAnalyser();
             analyser.fftSize = 256;
-            
             microphone = audioCtx.createMediaStreamSource(stream);
             microphone.connect(analyser);
             
+            audioChunks = [];
+            mediaRecorder = new MediaRecorder(stream);
+            
+            mediaRecorder.ondataavailable = e => {
+                if (e.data.size > 0) audioChunks.push(e.data);
+            };
+
+            mediaRecorder.onstop = () => {
+                const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                const reader = new FileReader();
+                reader.readAsDataURL(audioBlob);
+                reader.onloadend = () => {
+                    const base64Audio = reader.result;
+                    addDoc(messagesRef, {
+                        userId: myUserId,
+                        freq: currentFreq,
+                        audio: base64Audio,
+                        timestamp: Date.now()
+                    });
+                };
+            };
+
+            mediaRecorder.start();
             isTransmitting = true;
-            pttBtn.classList.add('active');
+            
+            pttBtn.classList.add('tx-active');
             pttBtn.innerText = "TX";
-            statusLabel.innerText = "Transmitiendo audio (" + currentFreq.toFixed(3) + " MHz)...";
+            statusLabel.innerText = "Emitiendo voz a la red...";
             statusLabel.style.color = "#ff3232";
             
-            drawWave(); // Iniciar animación
-            
-            // En una App Real (Fase 2): Aquí iniciarías un WebSocket o WebRTC 
-            // enviando los datos del "stream" hacia el servidor ESP32.
+            drawWaveTX(); 
             
         } catch (err) {
-            alert("Error: Debes dar permiso al micrófono. Nota: Los navegadores requieren HTTPS o localhost para usar micrófonos.");
+            alert("Error: Para transmitir debes dar permiso de micrófono (Requiere HTTPS).");
             console.error(err);
         }
     }
 
-    // Detener la transmisión
-    function stopAudio() {
+    function stopRecording() {
+        if (!isTransmitting) return;
         isTransmitting = false;
-        pttBtn.classList.remove('active');
-        pttBtn.innerText = "PTT";
-        statusLabel.innerText = "Standby. Presiona PTT para hablar.";
-        statusLabel.style.color = "#D3D4CB";
+        
+        if (mediaRecorder && mediaRecorder.state !== "inactive") {
+            mediaRecorder.stop();
+        }
         
         if (microphone) {
             microphone.disconnect();
             microphone.mediaStream.getTracks().forEach(track => track.stop());
         }
+
+        pttBtn.classList.remove('tx-active');
+        pttBtn.innerText = "PTT";
+        statusLabel.innerText = "Mensaje enviado.";
+        statusLabel.style.color = "#D3D4CB";
+        
         cancelAnimationFrame(animationId);
-        drawFlatLine(); // Volver a linea plana
+        drawFlatLine();
+        
+        setTimeout(() => { if(!isTransmitting && !isReceiving) statusLabel.innerText = "Standby."; }, 2000);
     }
 
-    // Lógica del Botón PTT (Mouse y Táctil para móviles)
-    pttBtn.addEventListener('mousedown', startAudio);
-    pttBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startAudio(); });
+    // ==========================================
+    // 5. RECEPCIÓN DE AUDIO (RX)
+    // ==========================================
+    function listenToMessages() {
+        onSnapshot(messagesRef, (snapshot) => {
+            snapshot.docChanges().forEach((change) => {
+                if (change.type === 'added') {
+                    const msg = change.doc.data();
+                    
+                    if (msg.timestamp > appStartTime && msg.freq === currentFreq && msg.userId !== myUserId) {
+                        playIncomingAudio(msg.audio);
+                    }
+                }
+            });
+        }, (error) => console.error("Error mensajes:", error));
+    }
 
-    pttBtn.addEventListener('mouseup', stopAudio);
-    pttBtn.addEventListener('mouseleave', () => { if(isTransmitting) stopAudio(); });
-    pttBtn.addEventListener('touchend', stopAudio);
+    function playIncomingAudio(base64Data) {
+        if (isTransmitting) return; 
 
-    // Dibujar Osciloscopio Animado
-    function drawWave() {
+        isReceiving = true;
+        pttBtn.classList.add('rx-active');
+        pttBtn.innerText = "RX";
+        statusLabel.innerText = "Recibiendo transmisión...";
+        statusLabel.style.color = "#32ff32";
+
+        const audio = new Audio(base64Data);
+        audio.play().catch(e => console.error("Autoplay bloqueado:", e));
+
+        drawWaveRX(); 
+
+        audio.onended = () => {
+            isReceiving = false;
+            pttBtn.classList.remove('rx-active');
+            pttBtn.innerText = "PTT";
+            statusLabel.innerText = "Standby.";
+            statusLabel.style.color = "#D3D4CB";
+            cancelAnimationFrame(animationId);
+            drawFlatLine();
+        };
+    }
+
+    // ==========================================
+    // 6. EVENTOS DE INTERFAZ
+    // ==========================================
+    const updateFreq = () => {
+        freqLabel.innerText = currentFreq.toFixed(3) + " MHz";
+        if(myUserId) setDoc(doc(usersRef, myUserId), { freq: currentFreq, lastPing: Date.now() });
+    };
+
+    document.getElementById('btnDown').addEventListener('click', () => { currentFreq -= 0.025; updateFreq(); });
+    document.getElementById('btnUp').addEventListener('click', () => { currentFreq += 0.025; updateFreq(); });
+
+    pttBtn.addEventListener('mousedown', startRecording);
+    pttBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
+
+    pttBtn.addEventListener('mouseup', stopRecording);
+    pttBtn.addEventListener('mouseleave', () => { if(isTransmitting) stopRecording(); });
+    pttBtn.addEventListener('touchend', stopRecording);
+
+    // ==========================================
+    // 7. MOTOR GRÁFICO DEL OSCILOSCOPIO
+    // ==========================================
+    function drawWaveTX() {
         if (!isTransmitting) return;
-
-        animationId = requestAnimationFrame(drawWave);
+        animationId = requestAnimationFrame(drawWaveTX);
 
         const bufferLength = analyser.frequencyBinCount;
         const dataArray = new Uint8Array(bufferLength);
@@ -217,26 +412,47 @@
         canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
         
         canvasCtx.lineWidth = 3;
-        canvasCtx.strokeStyle = '#ff3232'; // Rojo transmisión
+        canvasCtx.strokeStyle = '#ff3232'; 
         canvasCtx.beginPath();
 
         const sliceWidth = canvas.width * 1.0 / bufferLength;
         let x = 0;
 
         for (let i = 0; i < bufferLength; i++) {
-            const v = dataArray[i] / 128.0; // Rango de 0 a 2 (centro 1)
+            const v = dataArray[i] / 128.0; 
             const y = v * canvas.height / 2;
-
             if (i === 0) canvasCtx.moveTo(x, y);
             else canvasCtx.lineTo(x, y);
             x += sliceWidth;
         }
-
         canvasCtx.lineTo(canvas.width, canvas.height / 2);
         canvasCtx.stroke();
     }
 
-    // Dibujar Línea Plana (Standby)
+    function drawWaveRX() {
+        if (!isReceiving) return;
+        animationId = requestAnimationFrame(drawWaveRX);
+
+        canvasCtx.fillStyle = '#0A0F05';
+        canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        canvasCtx.lineWidth = 3;
+        canvasCtx.strokeStyle = '#32ff32'; 
+        canvasCtx.beginPath();
+
+        let x = 0;
+        const time = Date.now() / 150;
+        
+        for (let i = 0; i < canvas.width; i += 4) {
+            const amplitude = Math.random() * 25 + 5; 
+            const y = (canvas.height / 2) + (Math.sin((i * 0.1) + time) * amplitude * Math.sin(i * 0.05));
+            if (i === 0) canvasCtx.moveTo(x, y);
+            else canvasCtx.lineTo(x, y);
+            x += 4;
+        }
+        canvasCtx.stroke();
+    }
+
     function drawFlatLine() {
         canvasCtx.fillStyle = '#0A0F05';
         canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
@@ -248,8 +464,9 @@
         canvasCtx.stroke();
     }
 
-    // Dibujar línea plana al cargar la página
     drawFlatLine();
+    initAuth(); 
+
 </script>
 
 </body>
