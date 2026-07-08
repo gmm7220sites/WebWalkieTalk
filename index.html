@@ -126,13 +126,13 @@
 <body>
 
 <div class="container">
-    <h2>Global WebComms</h2>
+    <h2>WebComms Global</h2>
     
     <div class="users-badge" id="usersLabel">Buscando usuarios...</div>
 
     <div class="freq-control">
         <button class="btn-freq" id="btnDown">-</button>
-        <div class="freq-display" id="freqLabel">462.550 MHz</div>
+        <div class="freq-display" id="freqLabel">462.55 MHz</div>
         <button class="btn-freq" id="btnUp">+</button>
     </div>
 
@@ -143,65 +143,44 @@
     <div class="status" id="statusLabel">Standby. Conectando a la red...</div>
 </div>
 
-<!-- Usamos Type Module para importar Firebase -->
 <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-    import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-    import { getFirestore, collection, doc, setDoc, onSnapshot, addDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+    import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, collection, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
     // ==========================================
-    // 1. CONFIGURACIÓN FIREBASE 
+    // 1. CONFIGURACIÓN FIREBASE (Tus datos)
     // ==========================================
-    let firebaseConfig;
-    let isCanvas = false;
-    let appId = "walkietalkie-global";
-
-    try {
-        firebaseConfig = JSON.parse(__firebase_config);
-        if (typeof __app_id !== 'undefined') appId = __app_id;
-        isCanvas = true;
-    } catch (e) {
-        // Tu configuración de Firebase
-        firebaseConfig = {
-            apiKey: "AIzaSyAZJndi8_0x2_HQLcMQF-oxhoRLDr4izIc",
-            authDomain: "webwalkietalk.firebaseapp.com",
-            projectId: "webwalkietalk",
-            storageBucket: "webwalkietalk.firebasestorage.app",
-            messagingSenderId: "148022173413",
-            appId: "1:148022173413:web:fdf109271f8d7ce06efe0c"
-        };
-    }
+    const firebaseConfig = {
+        apiKey: "AIzaSyAZJndi8_0x2_HQLcMQF-oxhoRLDr4izIc",
+        authDomain: "webwalkietalk.firebaseapp.com",
+        projectId: "webwalkietalk",
+        storageBucket: "webwalkietalk.firebasestorage.app",
+        messagingSenderId: "148022173413",
+        appId: "1:148022173413:web:fdf109271f8d7ce06efe0c"
+    };
 
     const app = initializeApp(firebaseConfig);
     const auth = getAuth(app);
     const db = getFirestore(app);
 
-    let messagesRef, usersRef;
-
-    if (isCanvas) {
-        messagesRef = collection(db, 'artifacts', appId, 'public', 'data', 'walkie_messages');
-        usersRef = collection(db, 'artifacts', appId, 'public', 'data', 'walkie_users');
-    } else {
-        messagesRef = collection(db, 'walkie_messages');
-        usersRef = collection(db, 'walkie_users');
-    }
-
+    const usersRef = collection(db, 'walkie_users');
     let myUserId = "";
     const appStartTime = Date.now();
+    let currentUnsubscribe = null;
 
     // ==========================================
-    // 2. VARIABLES DE AUDIO Y APP
+    // 2. VARIABLES DE AUDIO (PCM RAW COMPATIBLE CON ESP32)
     // ==========================================
-    let currentFreq = 462.550;
+    let currentFreq = 462.55;
     let isTransmitting = false;
     let isReceiving = false;
-    let isSendingData = false; // Nuevo estado para evitar bloqueos
+    let isSendingData = false;
     
-    // Audio API
-    let audioCtx, analyser, microphone, globalStream;
-    let mediaRecorder;
-    let audioChunks = [];
+    let audioCtx, analyser, microphone, processor;
+    let pcmData = [];
     let animationId;
+    let lastPlayedTimestamp = 0;
 
     const freqLabel = document.getElementById('freqLabel');
     const pttBtn = document.getElementById('pttBtn');
@@ -213,17 +192,12 @@
     canvas.height = canvas.clientHeight;
 
     // ==========================================
-    // 3. INICIO DE SESIÓN Y RADAR DE USUARIOS
+    // 3. INICIO DE SESIÓN
     // ==========================================
     const initAuth = async () => {
         try {
-            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                await signInWithCustomToken(auth, __initial_auth_token);
-            } else {
-                await signInAnonymously(auth);
-            }
+            await signInAnonymously(auth);
         } catch (error) {
-            console.error("Error de Auth:", error);
             statusLabel.innerText = "Error conectando al servidor.";
         }
     };
@@ -233,7 +207,7 @@
             myUserId = user.uid;
             statusLabel.innerText = "Conectado. Presiona PTT para hablar.";
             startUserPing();
-            listenToMessages();
+            listenToChannel();
             listenToUsers();
         }
     });
@@ -241,10 +215,7 @@
     function startUserPing() {
         const updatePresence = () => {
             if(!myUserId) return;
-            setDoc(doc(usersRef, myUserId), {
-                freq: currentFreq,
-                lastPing: Date.now()
-            });
+            setDoc(doc(usersRef, myUserId), { freq: currentFreq, lastPing: Date.now() });
         };
         updatePresence();
         setInterval(updatePresence, 5000); 
@@ -254,108 +225,85 @@
         onSnapshot(usersRef, (snapshot) => {
             const now = Date.now();
             let activeCount = 0;
-            
             snapshot.forEach((docSnap) => {
                 const data = docSnap.data();
-                if (data.freq === currentFreq && (now - data.lastPing) < 15000) {
-                    activeCount++;
-                }
+                if (data.freq === currentFreq && (now - data.lastPing) < 15000) activeCount++;
             });
-
             usersLabel.innerText = `${activeCount} online en este canal`;
-        }, (error) => console.error("Error usuarios:", error));
+        });
+    }
+
+    function listenToChannel() {
+        if (currentUnsubscribe) currentUnsubscribe();
+        
+        let channelId = 'ch_' + currentFreq.toString().replace('.', '_');
+        currentUnsubscribe = onSnapshot(doc(db, 'walkie_channels', channelId), (docSnap) => {
+            if(docSnap.exists()) {
+                const msg = docSnap.data();
+                // Solo reproduce si es nuevo y no es nuestro propio mensaje
+                if(msg.timestamp !== lastPlayedTimestamp && msg.userId !== myUserId && msg.timestamp > appStartTime) {
+                    lastPlayedTimestamp = msg.timestamp;
+                    playIncomingPCM(msg.audio);
+                }
+            }
+        });
     }
 
     // ==========================================
-    // 4. TRANSMISIÓN DE AUDIO (TX) MEJORADA
+    // 4. TRANSMISIÓN DE AUDIO (PCM RAW)
     // ==========================================
-    
-    // Función para pedir permiso del micrófono solo UNA VEZ
     async function initMicrophone() {
-        if (globalStream) return true;
+        if (processor) return true;
         try {
-            globalStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 16000});
             analyser = audioCtx.createAnalyser();
             analyser.fftSize = 256;
-            microphone = audioCtx.createMediaStreamSource(globalStream);
+            
+            microphone = audioCtx.createMediaStreamSource(stream);
             microphone.connect(analyser);
+
+            // Procesador para obtener audio matematico en crudo
+            processor = audioCtx.createScriptProcessor(4096, 1, 1);
+            microphone.connect(processor);
+            processor.connect(audioCtx.destination); // Necesario para Chrome
+
+            processor.onaudioprocess = function(e) {
+                if(!isTransmitting) return;
+                // Límite de 3 segundos (48000 muestras a 16kHz) para proteger la RAM del ESP32
+                if(pcmData.length >= 48000) { stopRecording(); return; } 
+
+                const inputData = e.inputBuffer.getChannelData(0);
+                for(let i=0; i<inputData.length; i++) {
+                    let s = Math.max(-1, Math.min(1, inputData[i]));
+                    let val = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    pcmData.push(val & 0xFF);
+                    pcmData.push((val >> 8) & 0xFF);
+                }
+            };
             return true;
         } catch (err) {
-            alert("Error: Para transmitir debes dar permiso de micrófono.");
-            console.error(err);
+            alert("Debes permitir el micrófono.");
             return false;
         }
     }
 
     async function startRecording(e) {
         if (e) e.preventDefault();
-        
-        // Evita cruces: Si estamos recibiendo o enviando, ignorar el botón
         if (isReceiving || isSendingData || isTransmitting) return; 
 
-        statusLabel.innerText = "Iniciando micrófono...";
-        
+        if (audioCtx && audioCtx.state === 'suspended') await audioCtx.resume();
+
         const micReady = await initMicrophone();
-        if (!micReady) {
-            statusLabel.innerText = "Permiso de micrófono denegado.";
-            return;
-        }
+        if (!micReady) return;
 
-        // Configurar y arrancar grabadora
-        audioChunks = [];
-        mediaRecorder = new MediaRecorder(globalStream);
-        
-        mediaRecorder.ondataavailable = event => {
-            if (event.data.size > 0) audioChunks.push(event.data);
-        };
-
-        mediaRecorder.onstop = async () => {
-            if (audioChunks.length === 0) return;
-
-            isSendingData = true;
-            pttBtn.classList.add('disabled');
-            statusLabel.innerText = "Enviando paquete de datos...";
-            statusLabel.style.color = "#D5DE10";
-
-            // Convertir a base64
-            const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-            const reader = new FileReader();
-            reader.readAsDataURL(audioBlob);
-            reader.onloadend = async () => {
-                const base64Audio = reader.result;
-                try {
-                    await addDoc(messagesRef, {
-                        userId: myUserId,
-                        freq: currentFreq,
-                        audio: base64Audio,
-                        timestamp: Date.now()
-                    });
-                    statusLabel.innerText = "Mensaje enviado con éxito.";
-                } catch (err) {
-                    console.error("Error enviando:", err);
-                    statusLabel.innerText = "Error enviando el mensaje.";
-                }
-                
-                isSendingData = false;
-                pttBtn.classList.remove('disabled');
-                statusLabel.style.color = "#D3D4CB";
-                setTimeout(() => { 
-                    if(!isTransmitting && !isReceiving && !isSendingData) {
-                        statusLabel.innerText = "Standby. Presiona PTT para hablar."; 
-                    }
-                }, 1500);
-            };
-        };
-
-        mediaRecorder.start();
+        pcmData = [];
         isTransmitting = true;
         
         pttBtn.classList.add('tx-active');
         pttBtn.innerText = "TX";
-        statusLabel.innerText = "Emitiendo voz...";
+        statusLabel.innerText = "Emitiendo... (Max 3s)";
         statusLabel.style.color = "#ff3232";
-        
         drawWaveTX(); 
     }
 
@@ -364,37 +312,65 @@
         if (!isTransmitting) return;
         
         isTransmitting = false;
-        
-        if (mediaRecorder && mediaRecorder.state !== "inactive") {
-            mediaRecorder.stop();
-        }
-
         pttBtn.classList.remove('tx-active');
-        pttBtn.innerText = "PTT";
-        
+        pttBtn.classList.add('disabled');
+        statusLabel.innerText = "Enviando paquete a satélite...";
+        statusLabel.style.color = "#D5DE10";
         cancelAnimationFrame(animationId);
         drawFlatLine();
+
+        isSendingData = true;
+
+        // Convertir PCM crudo a Base64 rápido
+        let binary = '';
+        const bytes = new Uint8Array(pcmData);
+        for(let i=0; i<bytes.byteLength; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        const base64Audio = window.btoa(binary);
+
+        let channelId = 'ch_' + currentFreq.toString().replace('.', '_');
+        let ts = Date.now();
+        lastPlayedTimestamp = ts; // Para no auto-reproducirnos
+
+        setDoc(doc(db, 'walkie_channels', channelId), {
+            userId: myUserId,
+            freq: currentFreq,
+            audio: base64Audio,
+            timestamp: ts
+        }).then(() => {
+            isSendingData = false;
+            pttBtn.classList.remove('disabled');
+            statusLabel.style.color = "#D3D4CB";
+            statusLabel.innerText = "Standby.";
+        });
     }
 
     // ==========================================
-    // 5. RECEPCIÓN DE AUDIO (RX)
+    // 5. RECEPCIÓN DE AUDIO (PCM RAW)
     // ==========================================
-    function listenToMessages() {
-        onSnapshot(messagesRef, (snapshot) => {
-            snapshot.docChanges().forEach((change) => {
-                if (change.type === 'added') {
-                    const msg = change.doc.data();
-                    // Evita reproducir si el mensaje es viejo, es de otra frecuencia, o lo enviaste tú
-                    if (msg.timestamp > appStartTime && msg.freq === currentFreq && msg.userId !== myUserId) {
-                        playIncomingAudio(msg.audio);
-                    }
-                }
-            });
-        }, (error) => console.error("Error mensajes:", error));
+    function base64ToFloat32Array(base64) {
+        let binary = window.atob(base64);
+        let len = binary.length;
+        let bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+        
+        let floatArray = new Float32Array(len / 2);
+        for(let i=0; i<len/2; i++) {
+            let low = bytes[i*2];
+            let high = bytes[i*2+1];
+            let sample = (high << 8) | low;
+            if (sample >= 0x8000) sample -= 0x10000;
+            floatArray[i] = sample / 32768.0;
+        }
+        return floatArray;
     }
 
-    function playIncomingAudio(base64Data) {
+    function playIncomingPCM(base64Data) {
         if (isTransmitting || isSendingData) return; 
+
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 16000});
+        if (audioCtx.state === 'suspended') audioCtx.resume();
 
         isReceiving = true;
         pttBtn.classList.add('rx-active');
@@ -402,37 +378,45 @@
         statusLabel.innerText = "Recibiendo transmisión...";
         statusLabel.style.color = "#32ff32";
 
-        const audio = new Audio(base64Data);
-        audio.play().catch(e => {
-            console.error("Autoplay bloqueado:", e);
-            statusLabel.innerText = "Haz clic en la pantalla para permitir el audio.";
-        });
+        try {
+            let floatArray = base64ToFloat32Array(base64Data);
+            let audioBuffer = audioCtx.createBuffer(1, floatArray.length, 16000);
+            audioBuffer.getChannelData(0).set(floatArray);
 
-        drawWaveRX(); 
+            let source = audioCtx.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioCtx.destination);
+            
+            drawWaveRX(); 
 
-        audio.onended = () => {
+            source.onended = () => {
+                isReceiving = false;
+                pttBtn.classList.remove('rx-active');
+                pttBtn.innerText = "PTT";
+                statusLabel.innerText = "Standby.";
+                statusLabel.style.color = "#D3D4CB";
+                cancelAnimationFrame(animationId);
+                drawFlatLine();
+            };
+            source.start();
+        } catch(e) {
+            console.error("Error decodificando PCM", e);
             isReceiving = false;
-            pttBtn.classList.remove('rx-active');
-            pttBtn.innerText = "PTT";
-            statusLabel.innerText = "Standby. Presiona PTT para hablar.";
-            statusLabel.style.color = "#D3D4CB";
-            cancelAnimationFrame(animationId);
-            drawFlatLine();
-        };
+        }
     }
 
     // ==========================================
     // 6. EVENTOS DE INTERFAZ
     // ==========================================
     const updateFreq = () => {
-        freqLabel.innerText = currentFreq.toFixed(3) + " MHz";
+        freqLabel.innerText = currentFreq.toFixed(2) + " MHz";
+        listenToChannel(); // Cambiar de sala en Firebase
         if(myUserId) setDoc(doc(usersRef, myUserId), { freq: currentFreq, lastPing: Date.now() });
     };
 
-    document.getElementById('btnDown').addEventListener('click', () => { currentFreq -= 0.025; updateFreq(); });
-    document.getElementById('btnUp').addEventListener('click', () => { currentFreq += 0.025; updateFreq(); });
+    document.getElementById('btnDown').addEventListener('click', () => { currentFreq -= 0.05; updateFreq(); });
+    document.getElementById('btnUp').addEventListener('click', () => { currentFreq += 0.05; updateFreq(); });
 
-    // Soportar eventos táctiles y de mouse sin conflictos
     pttBtn.addEventListener('mousedown', startRecording);
     pttBtn.addEventListener('touchstart', startRecording, {passive: false});
 
@@ -446,51 +430,36 @@
     function drawWaveTX() {
         if (!isTransmitting) return;
         animationId = requestAnimationFrame(drawWaveTX);
-
         const bufferLength = analyser.frequencyBinCount;
         const dataArray = new Uint8Array(bufferLength);
         analyser.getByteTimeDomainData(dataArray);
 
         canvasCtx.fillStyle = '#0A0F05';
         canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
-        
-        canvasCtx.lineWidth = 3;
-        canvasCtx.strokeStyle = '#ff3232'; 
-        canvasCtx.beginPath();
-
-        const sliceWidth = canvas.width * 1.0 / bufferLength;
-        let x = 0;
+        canvasCtx.lineWidth = 3; canvasCtx.strokeStyle = '#ff3232'; canvasCtx.beginPath();
+        let x = 0; const sliceWidth = canvas.width * 1.0 / bufferLength;
 
         for (let i = 0; i < bufferLength; i++) {
             const v = dataArray[i] / 128.0; 
             const y = v * canvas.height / 2;
-            if (i === 0) canvasCtx.moveTo(x, y);
-            else canvasCtx.lineTo(x, y);
+            if (i === 0) canvasCtx.moveTo(x, y); else canvasCtx.lineTo(x, y);
             x += sliceWidth;
         }
-        canvasCtx.lineTo(canvas.width, canvas.height / 2);
-        canvasCtx.stroke();
+        canvasCtx.lineTo(canvas.width, canvas.height / 2); canvasCtx.stroke();
     }
 
     function drawWaveRX() {
         if (!isReceiving) return;
         animationId = requestAnimationFrame(drawWaveRX);
-
         canvasCtx.fillStyle = '#0A0F05';
         canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
-        
-        canvasCtx.lineWidth = 3;
-        canvasCtx.strokeStyle = '#32ff32'; 
-        canvasCtx.beginPath();
+        canvasCtx.lineWidth = 3; canvasCtx.strokeStyle = '#32ff32'; canvasCtx.beginPath();
 
-        let x = 0;
-        const time = Date.now() / 150;
-        
+        let x = 0; const time = Date.now() / 150;
         for (let i = 0; i < canvas.width; i += 4) {
             const amplitude = Math.random() * 25 + 5; 
             const y = (canvas.height / 2) + (Math.sin((i * 0.1) + time) * amplitude * Math.sin(i * 0.05));
-            if (i === 0) canvasCtx.moveTo(x, y);
-            else canvasCtx.lineTo(x, y);
+            if (i === 0) canvasCtx.moveTo(x, y); else canvasCtx.lineTo(x, y);
             x += 4;
         }
         canvasCtx.stroke();
@@ -499,11 +468,8 @@
     function drawFlatLine() {
         canvasCtx.fillStyle = '#0A0F05';
         canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
-        canvasCtx.lineWidth = 2;
-        canvasCtx.strokeStyle = '#555';
-        canvasCtx.beginPath();
-        canvasCtx.moveTo(0, canvas.height / 2);
-        canvasCtx.lineTo(canvas.width, canvas.height / 2);
+        canvasCtx.lineWidth = 2; canvasCtx.strokeStyle = '#555'; canvasCtx.beginPath();
+        canvasCtx.moveTo(0, canvas.height / 2); canvasCtx.lineTo(canvas.width, canvas.height / 2);
         canvasCtx.stroke();
     }
 
